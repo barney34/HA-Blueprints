@@ -1,0 +1,93 @@
+blueprint:
+  name: Presence Light Commander
+  description: >
+    The ultimate logic for occupancy-driven lighting. 
+    1. Turns on lights instantly when presence is detected.
+    2. Executes a graceful 'Fade to Black' when the room is empty.
+    3. Employs a 'Hard-Off' Failsafe to ensure lights never get stuck on.
+  domain: automation
+  input:
+    presence_sensor:
+      name: Presence/Occupancy Sensor
+      description: The binary sensor that tells us someone is in the room.
+      selector:
+        entity:
+          domain: binary_sensor
+          device_class: occupancy
+    target_light:
+      name: Managed Light
+      description: The light entity this logic will command.
+      selector:
+        entity:
+          domain: light
+    fade_duration:
+      name: Fade to Black Duration
+      description: How long the transition from current brightness to 0% should take.
+      default: 45
+      selector:
+        number:
+          min: 5
+          max: 300
+          unit_of_measurement: seconds
+
+# MODE: RESTART
+# This is the "Magic" - if you step back into the room during the fade, 
+# the entire 'Clear' sequence and the Failsafe timer are instantly 
+# incinerated and replaced by the 'Occupied' signal.
+mode: restart 
+
+trigger:
+  - platform: state
+    entity_id: !input presence_sensor
+    to: "on"
+    id: "occupied"
+  - platform: state
+    entity_id: !input presence_sensor
+    to: "off"
+    id: "clear"
+
+action:
+  - choose:
+      # --- SCENARIO 1: ROOM OCCUPIED ---
+      - conditions:
+          - condition: trigger
+            id: "occupied"
+        sequence:
+          - action: light.turn_on
+            target:
+              entity_id: !input target_light
+
+      # --- SCENARIO 2: ROOM CLEARED ---
+      - conditions:
+          - condition: trigger
+            id: "clear"
+        sequence:
+          # Start the Graceful Fade
+          - action: script.ashley_s_light_fader_2
+            data:
+              light: !input target_light
+              endBrightnessPercent: 0
+              transitionTime:
+                seconds: !input fade_duration
+              stopEntity: !input presence_sensor
+              lampBrightnessScale: "zeroToTwoFiftyFive"
+              easingTypeInput: "easeInQuart"
+              endBrightnessEntityScale: "zeroToOneHundred"
+              autoCancelThreshold: 10
+              shouldStopIfTheLampIsTurnedOffDuringTheFade: true
+
+          # THE FAILSAFE TIMER
+          # We wait for the fade to complete + a 10-second 'sanity' buffer.
+          - delay:
+              seconds: "{{ (fade_duration | int) + 10 }}"
+          
+          # THE VERIFICATION
+          # If the light is still 'on' (meaning the script or Adaptive Lighting 
+          # blocked the turn-off), we force a Hard Kill.
+          - if:
+              - condition: template
+                value_template: "{{ is_state(target_light, 'on') }}"
+            then:
+              - action: light.turn_off
+                target:
+                  entity_id: !input target_light
