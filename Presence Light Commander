@@ -2,11 +2,12 @@ blueprint:
   name: Presence Light Commander
   author: sholland
   description: >
-    v2.5 - Professional Presence Engine.
-    - RESTART MODE: Re-entry instantly cancels all pending fades and failsafes.
+    v3.1 - The Reboot-Proof Edition.
+    - PERSISTENT TIMERS: Uses state-tracking so transitions survive HA restarts.
+    - STANDALONE: No external scripts required.
+    - RESTART MODE: Re-entry instantly cancels all pending fades.
     - OVERRIDES: 'Disable Trigger' (ON = no lights) and 'Block Turn Off' (ON = stay on).
-    - AL COMPATIBLE: Uses a clean turn-on to ensure Adaptive Lighting stays in Automatic Mode.
-    - PREREQUISITE: Requires 'Ashley's Light Fader' (script.ashley_s_light_fader_2).
+    - AL COMPATIBLE: Uses native transitions to keep Adaptive Lighting happy.
   domain: automation
   input:
     presence_sensor:
@@ -23,14 +24,12 @@ blueprint:
     # --- OPTIONAL OVERRIDES ---
     disable_switch:
       name: Disable Trigger Switch (Optional)
-      description: "If this switch is ON, the automation will NOT turn the light on (e.g., Night Mode)."
       default: 
       selector:
         entity:
           domain: [input_boolean, switch, binary_sensor]
     block_off_switch:
       name: Block Turn Off Switch (Optional)
-      description: "If this switch is ON, the automation will NOT turn the light off (e.g., Party Mode)."
       default: 
       selector:
         entity:
@@ -38,7 +37,6 @@ blueprint:
     # --- DEPENDENCIES ---
     dependency_entities:
       name: Secondary Occupancy/Lights (Optional)
-      description: "The countdown will NOT start until ALL of these are also OFF."
       default: []
       selector:
         entity:
@@ -61,8 +59,10 @@ variables:
   deps: !input dependency_entities
   light_ent: !input target_light
   fade_val: !input fade_duration
+  sensor_ent: !input presence_sensor
 
 trigger:
+  # 1. Standard Motion
   - platform: state
     entity_id: !input presence_sensor
     to: "on"
@@ -71,14 +71,19 @@ trigger:
     entity_id: !input presence_sensor
     to: "off"
     id: "clear"
+  # 2. Dependency Clear
   - platform: state
     entity_id: !input dependency_entities
     to: "off"
     id: "dependency_cleared"
+  # 3. THE REBOOT TRIGGER: Run this logic whenever HA starts up
+  - platform: homeassistant
+    event: start
+    id: "reboot"
 
 action:
   - choose:
-      # --- 1. OCCUPIED (Turn ON) ---
+      # --- SCENARIO 1: OCCUPIED (Turn ON) ---
       - conditions:
           - condition: trigger
             id: "occupied"
@@ -86,12 +91,11 @@ action:
             alias: "Logic: Only run if NOT disabled"
             value_template: "{{ disable_ent == none or is_state(disable_ent, 'off') }}"
         sequence:
-          # Clean turn_on. No data/transition = AL handles everything automatically.
           - action: light.turn_on
             target:
               entity_id: !input target_light
 
-      # --- 2. CLEAR (Fade Out) ---
+      # --- SCENARIO 2: CLEAR OR REBOOT (The Fade/Off Logic) ---
       - conditions:
           - condition: or
             conditions:
@@ -99,42 +103,42 @@ action:
                 id: "clear"
               - condition: trigger
                 id: "dependency_cleared"
+              - condition: trigger
+                id: "reboot"
+          # Only proceed if the room is actually empty
           - condition: state
             entity_id: !input presence_sensor
             state: "off"
         sequence:
-          # A. Dependency Check
+          # A. Dependency Check: Ensure secondary items are off
           - condition: template
-            alias: "Stop if dependencies are still active"
+            alias: "Wait for secondary entities"
             value_template: >
               {% if deps == none or deps == [] %} true
               {% else %} {{ expand(deps) | selectattr('state', 'eq', 'on') | list | count == 0 }}
               {% endif %}
 
-          # B. Block Check
+          # B. Block Check (Party Mode)
           - condition: template
-            alias: "Stop if Turn-Off is blocked"
+            alias: "Check if turn-off is blocked"
             value_template: "{{ block_ent == none or is_state(block_ent, 'off') }}"
 
-          # C. Execute Graceful Fade
-          - action: script.ashley_s_light_fader_2
+          # C. The Native Fade
+          - action: light.turn_off
+            target:
+              entity_id: !input target_light
             data:
-              light: !input target_light
-              endBrightnessPercent: 0
-              transitionTime:
-                seconds: "{{ fade_val }}"
-              stopEntity: !input presence_sensor
-              lampBrightnessScale: "zeroToTwoFiftyFive"
-              easingTypeInput: "easeInQuart"
-              endBrightnessEntityScale: "zeroToOneHundred"
-              autoCancelThreshold: 10
-              shouldStopIfTheLampIsTurnedOffDuringTheFade: true
+              transition: "{{ fade_val }}"
 
-          # D. Failsafe Delay
-          - delay:
-              seconds: "{{ (fade_val | int) + 10 }}"
-          
-          # E. Verification (The Hard Kill)
+          # D. THE PERSISTENT WAIT: 
+          # Instead of a 'delay', we wait for the sensor to have been off for the fade time.
+          # If HA reboots, this 'wait' recalculates based on actual clock time.
+          - wait_for_trigger:
+              - platform: template
+                value_template: "{{ (as_timestamp(now()) - as_timestamp(states[sensor_ent].last_changed)) > (fade_val | int + 5) }}"
+            timeout: "00:06:00" # Safety timeout (6 minutes)
+
+          # E. Final Verification (The Hard Kill)
           - if:
               - condition: template
                 alias: "Is light still on and NOT blocked?"
