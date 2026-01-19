@@ -2,12 +2,11 @@ blueprint:
   name: Presence Light Commander
   author: sholland
   description: >
-    The ultimate presence-based lighting engine.
-    - RESTART MODE: Re-entry instantly cancels fades and failsafes.
-    - DUAL TRANSITION: Smooth ramp-up on entry, graceful fade on exit.
-    - OVERRIDES: Optional Kill-Switch (prevent ON) and Hold-Switch (prevent OFF).
-    - DEPENDENCIES: Restarts timer if secondary sensors/lights are active.
-    - FAILSAFE: Hard-off verification to bypass Adaptive Lighting 'locks'.
+    v2.5 - Professional Presence Engine.
+    - RESTART MODE: Re-entry instantly cancels all pending fades and failsafes.
+    - OVERRIDES: 'Disable Trigger' (ON = no lights) and 'Block Turn Off' (ON = stay on).
+    - AL COMPATIBLE: Uses a clean turn-on to ensure Adaptive Lighting stays in Automatic Mode.
+    - PREREQUISITE: Requires 'Ashley's Light Fader' (script.ashley_s_light_fader_2).
   domain: automation
   input:
     presence_sensor:
@@ -21,42 +20,32 @@ blueprint:
       selector:
         entity:
           domain: light
-    # --- OVERRIDES ---
-    kill_switch:
-      name: Global Kill Switch (Optional)
-      description: If ON, the light will NOT turn on (e.g., Night Mode).
-      default: []
+    # --- OPTIONAL OVERRIDES ---
+    disable_switch:
+      name: Disable Trigger Switch (Optional)
+      description: "If this switch is ON, the automation will NOT turn the light on (e.g., Night Mode)."
+      default: 
       selector:
         entity:
           domain: [input_boolean, switch, binary_sensor]
-    party_mode:
-      name: Party Mode / Hold Switch (Optional)
-      description: If ON, the light will NOT turn off.
-      default: []
+    block_off_switch:
+      name: Block Turn Off Switch (Optional)
+      description: "If this switch is ON, the automation will NOT turn the light off (e.g., Party Mode)."
+      default: 
       selector:
         entity:
           domain: [input_boolean, switch, binary_sensor]
     # --- DEPENDENCIES ---
     dependency_entities:
       name: Secondary Occupancy/Lights (Optional)
-      description: Stay ON/Wait to fade until ALL of these entities are also OFF.
+      description: "The countdown will NOT start until ALL of these are also OFF."
       default: []
       selector:
         entity:
           multiple: true
     # --- TIMING ---
-    on_transition:
-      name: Brighten Duration
-      description: How many seconds the light takes to reach target brightness when you enter.
-      default: 2
-      selector:
-        number:
-          min: 0
-          max: 10
-          unit_of_measurement: seconds
     fade_duration:
       name: Fade Duration
-      description: How many seconds the light takes to fade to 0% when you leave.
       default: 45
       selector:
         number:
@@ -67,11 +56,11 @@ blueprint:
 mode: restart 
 
 variables:
-  input_kill_switch: !input kill_switch
-  input_party_mode: !input party_mode
-  input_dependency_entities: !input dependency_entities
-  input_target_light: !input target_light
-  input_on_transition: !input on_transition
+  disable_ent: !input disable_switch
+  block_ent: !input block_off_switch
+  deps: !input dependency_entities
+  light_ent: !input target_light
+  fade_val: !input fade_duration
 
 trigger:
   - platform: state
@@ -85,52 +74,55 @@ trigger:
   - platform: state
     entity_id: !input dependency_entities
     to: "off"
+    id: "dependency_cleared"
 
 action:
   - choose:
-      # --- SCENARIO 1: OCCUPIED (Turn ON) ---
+      # --- 1. OCCUPIED (Turn ON) ---
       - conditions:
           - condition: trigger
             id: "occupied"
           - condition: template
-            alias: "Check Kill Switch"
-            value_template: "{{ input_kill_switch == none or input_kill_switch == [] or is_state(input_kill_switch, 'off') }}"
+            alias: "Logic: Only run if NOT disabled"
+            value_template: "{{ disable_ent == none or is_state(disable_ent, 'off') }}"
         sequence:
+          # Clean turn_on. No data/transition = AL handles everything automatically.
           - action: light.turn_on
             target:
               entity_id: !input target_light
-            data:
-              transition: "{{ input_on_transition }}"
 
-      # --- SCENARIO 2: CLEAR (Start the Fade) ---
+      # --- 2. CLEAR (Fade Out) ---
       - conditions:
+          - condition: or
+            conditions:
+              - condition: trigger
+                id: "clear"
+              - condition: trigger
+                id: "dependency_cleared"
           - condition: state
             entity_id: !input presence_sensor
             state: "off"
         sequence:
           # A. Dependency Check
           - condition: template
-            alias: "Ensure all Dependencies are OFF"
+            alias: "Stop if dependencies are still active"
             value_template: >
-              {% set deps = input_dependency_entities %}
-              {% if deps == none or deps == [] %}
-                true
-              {% else %}
-                {{ expand(deps) | selectattr('state', 'eq', 'on') | list | count == 0 }}
+              {% if deps == none or deps == [] %} true
+              {% else %} {{ expand(deps) | selectattr('state', 'eq', 'on') | list | count == 0 }}
               {% endif %}
 
-          # B. Hold Check
+          # B. Block Check
           - condition: template
-            alias: "Check Party Mode"
-            value_template: "{{ input_party_mode == none or input_party_mode == [] or is_state(input_party_mode, 'off') }}"
+            alias: "Stop if Turn-Off is blocked"
+            value_template: "{{ block_ent == none or is_state(block_ent, 'off') }}"
 
-          # C. Start the Fader Script
+          # C. Execute Graceful Fade
           - action: script.ashley_s_light_fader_2
             data:
               light: !input target_light
               endBrightnessPercent: 0
               transitionTime:
-                seconds: !input fade_duration
+                seconds: "{{ fade_val }}"
               stopEntity: !input presence_sensor
               lampBrightnessScale: "zeroToTwoFiftyFive"
               easingTypeInput: "easeInQuart"
@@ -138,17 +130,17 @@ action:
               autoCancelThreshold: 10
               shouldStopIfTheLampIsTurnedOffDuringTheFade: true
 
-          # D. Failsafe Delay (Fade Time + 10s Buffer)
+          # D. Failsafe Delay
           - delay:
-              seconds: "{{ (fade_duration | int) + 10 }}"
+              seconds: "{{ (fade_val | int) + 10 }}"
           
-          # E. The Hard Kill Verification
+          # E. Verification (The Hard Kill)
           - if:
               - condition: template
-                value_template: "{{ is_state(input_target_light, 'on') }}"
-              - condition: template
-                alias: "Final Party Mode Check"
-                value_template: "{{ input_party_mode == none or input_party_mode == [] or is_state(input_party_mode, 'off') }}"
+                alias: "Is light still on and NOT blocked?"
+                value_template: >
+                  {{ is_state(light_ent, 'on') and 
+                     (block_ent == none or is_state(block_ent, 'off')) }}
             then:
               - action: light.turn_off
                 target:
