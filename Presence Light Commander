@@ -1,28 +1,62 @@
 blueprint:
   name: Presence Light Commander
+  author: sholland
   description: >
-    The ultimate logic for occupancy-driven lighting. 
-    1. Turns on lights instantly when presence is detected.
-    2. Executes a graceful 'Fade to Black' when the room is empty.
-    3. Employs a 'Hard-Off' Failsafe to ensure lights never get stuck on.
+    The ultimate presence-based lighting engine.
+    - RESTART MODE: Re-entry instantly cancels fades and failsafes.
+    - DUAL TRANSITION: Smooth ramp-up on entry, graceful fade on exit.
+    - OVERRIDES: Optional Kill-Switch (prevent ON) and Hold-Switch (prevent OFF).
+    - DEPENDENCIES: Restarts timer if secondary sensors/lights are active.
+    - FAILSAFE: Hard-off verification to bypass Adaptive Lighting 'locks'.
   domain: automation
   input:
     presence_sensor:
-      name: Presence/Occupancy Sensor
-      description: The binary sensor that tells us someone is in the room.
+      name: Primary Presence Sensor
       selector:
         entity:
           domain: binary_sensor
           device_class: occupancy
     target_light:
       name: Managed Light
-      description: The light entity this logic will command.
       selector:
         entity:
           domain: light
+    # --- OVERRIDES ---
+    kill_switch:
+      name: Global Kill Switch (Optional)
+      description: If ON, the light will NOT turn on (e.g., Night Mode).
+      default: []
+      selector:
+        entity:
+          domain: [input_boolean, switch, binary_sensor]
+    party_mode:
+      name: Party Mode / Hold Switch (Optional)
+      description: If ON, the light will NOT turn off.
+      default: []
+      selector:
+        entity:
+          domain: [input_boolean, switch, binary_sensor]
+    # --- DEPENDENCIES ---
+    dependency_entities:
+      name: Secondary Occupancy/Lights (Optional)
+      description: Stay ON/Wait to fade until ALL of these entities are also OFF.
+      default: []
+      selector:
+        entity:
+          multiple: true
+    # --- TIMING ---
+    on_transition:
+      name: Brighten Duration
+      description: How many seconds the light takes to reach target brightness when you enter.
+      default: 2
+      selector:
+        number:
+          min: 0
+          max: 10
+          unit_of_measurement: seconds
     fade_duration:
-      name: Fade to Black Duration
-      description: How long the transition from current brightness to 0% should take.
+      name: Fade Duration
+      description: How many seconds the light takes to fade to 0% when you leave.
       default: 45
       selector:
         number:
@@ -30,11 +64,14 @@ blueprint:
           max: 300
           unit_of_measurement: seconds
 
-# MODE: RESTART
-# This is the "Magic" - if you step back into the room during the fade, 
-# the entire 'Clear' sequence and the Failsafe timer are instantly 
-# incinerated and replaced by the 'Occupied' signal.
 mode: restart 
+
+variables:
+  input_kill_switch: !input kill_switch
+  input_party_mode: !input party_mode
+  input_dependency_entities: !input dependency_entities
+  input_target_light: !input target_light
+  input_on_transition: !input on_transition
 
 trigger:
   - platform: state
@@ -45,24 +82,49 @@ trigger:
     entity_id: !input presence_sensor
     to: "off"
     id: "clear"
+  - platform: state
+    entity_id: !input dependency_entities
+    to: "off"
 
 action:
   - choose:
-      # --- SCENARIO 1: ROOM OCCUPIED ---
+      # --- SCENARIO 1: OCCUPIED (Turn ON) ---
       - conditions:
           - condition: trigger
             id: "occupied"
+          - condition: template
+            alias: "Check Kill Switch"
+            value_template: "{{ input_kill_switch == none or input_kill_switch == [] or is_state(input_kill_switch, 'off') }}"
         sequence:
           - action: light.turn_on
             target:
               entity_id: !input target_light
+            data:
+              transition: "{{ input_on_transition }}"
 
-      # --- SCENARIO 2: ROOM CLEARED ---
+      # --- SCENARIO 2: CLEAR (Start the Fade) ---
       - conditions:
-          - condition: trigger
-            id: "clear"
+          - condition: state
+            entity_id: !input presence_sensor
+            state: "off"
         sequence:
-          # Start the Graceful Fade
+          # A. Dependency Check
+          - condition: template
+            alias: "Ensure all Dependencies are OFF"
+            value_template: >
+              {% set deps = input_dependency_entities %}
+              {% if deps == none or deps == [] %}
+                true
+              {% else %}
+                {{ expand(deps) | selectattr('state', 'eq', 'on') | list | count == 0 }}
+              {% endif %}
+
+          # B. Hold Check
+          - condition: template
+            alias: "Check Party Mode"
+            value_template: "{{ input_party_mode == none or input_party_mode == [] or is_state(input_party_mode, 'off') }}"
+
+          # C. Start the Fader Script
           - action: script.ashley_s_light_fader_2
             data:
               light: !input target_light
@@ -76,17 +138,17 @@ action:
               autoCancelThreshold: 10
               shouldStopIfTheLampIsTurnedOffDuringTheFade: true
 
-          # THE FAILSAFE TIMER
-          # We wait for the fade to complete + a 10-second 'sanity' buffer.
+          # D. Failsafe Delay (Fade Time + 10s Buffer)
           - delay:
               seconds: "{{ (fade_duration | int) + 10 }}"
           
-          # THE VERIFICATION
-          # If the light is still 'on' (meaning the script or Adaptive Lighting 
-          # blocked the turn-off), we force a Hard Kill.
+          # E. The Hard Kill Verification
           - if:
               - condition: template
-                value_template: "{{ is_state(target_light, 'on') }}"
+                value_template: "{{ is_state(input_target_light, 'on') }}"
+              - condition: template
+                alias: "Final Party Mode Check"
+                value_template: "{{ input_party_mode == none or input_party_mode == [] or is_state(input_party_mode, 'off') }}"
             then:
               - action: light.turn_off
                 target:
